@@ -6,7 +6,8 @@ set(src_dirs
             XL9555
             LEDC
             MYIIC
-            MYSPI)
+            MYSPI
+            RELAY)
 
 set(include_dirs
             ./LED
@@ -16,7 +17,8 @@ set(include_dirs
             ./XL9555
             ./LEDC
             ./MYIIC
-            ./MYSPI)
+            ./MYSPI
+            ./RELAY)
 
 set(requires
             driver
