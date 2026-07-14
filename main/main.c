@@ -4,7 +4,7 @@
  * @author      正点原子团队(ALIENTEK)
  * @version     V1.0
  * @date        2025-01-01
- * @brief       UART实验
+ * @brief       UART实验（增加WiFi TCP客户端功能）
  * @license     Copyright (c) 2020-2032, 广州市星翼电子科技有限公司
  ******************************************************************************
  * @attention
@@ -27,11 +27,48 @@
 #include "spilcd.h"
 #include "xl9555.h"
 #include "my_spi.h"
+#include "wifi_client.h"
 
 // 用于存储最后接收到的UART数据（使用较小的缓冲区用于显示）
 #define DISPLAY_BUF_SIZE 128
 static char last_rx_data[DISPLAY_BUF_SIZE + 1] = {0};
 static bool has_new_data = false;
+
+/**
+ * @brief       WiFi事件回调函数
+ * @param       event: WiFi事件类型
+ * @param       data: 事件数据
+ * @retval      无
+ */
+static void wifi_event_callback(wifi_client_event_t event, void *data)
+{
+    switch (event) {
+        case WIFI_EVENT_DISCONNECTED:
+            printf("[WiFi] Disconnected from AP\n");
+            break;
+        case WIFI_EVENT_CONNECTED:
+            printf("[WiFi] Connected to AP\n");
+            break;
+        case WIFI_EVENT_GOT_IP:
+            printf("[WiFi] Got IP address\n");
+            break;
+        case TCP_EVENT_CONNECTED:
+            printf("[TCP] Connected to server\n");
+            // 在LCD上显示连接状态
+            spilcd_clear(WHITE);
+            spilcd_show_string(10, 10, spilcddev.width - 20, 20, 16, "WiFi+TCP OK", BLACK);
+            spilcd_show_string(10, 40, spilcddev.width - 20, 20, 16, "Ready...", BLACK);
+            break;
+        case TCP_EVENT_DISCONNECTED:
+            printf("[TCP] Disconnected from server\n");
+            break;
+        case TCP_EVENT_DATA_RECEIVED:
+            printf("[TCP] Data received\n");
+            break;
+        default:
+            break;
+    }
+}
 
 /**
  * @brief       程序入口
@@ -60,13 +97,12 @@ void app_main(void)
         .gpio_num = LEDC_PWM_CH0_GPIO             /* GPIO1 */
     };
 
-    ret = nvs_flash_init();         /* 初始化NVS */
+    printf("=== System Starting ===\n");
 
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND)
-    {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ESP_ERROR_CHECK(nvs_flash_init());
-    }
+    // 初始化WiFi TCP客户端（包含NVS初始化）
+    printf("Initializing WiFi TCP client...\n");
+    wifi_tcp_client_init(wifi_event_callback);
+    printf("WiFi TCP client initialized\n");
 
     xl9555_init();                  /* 初始化XL9555(IO扩展芯片) */
     printf("XL9555 initialized successfully\n");
@@ -86,17 +122,26 @@ void app_main(void)
     printf("SPILCD initialized successfully\n");
     printf("LCD size: %dx%d\n", spilcddev.width, spilcddev.height);
 
+    // 启动WiFi和TCP连接（这会阻塞直到连接成功或失败）
+    printf("Starting WiFi connection...\n");
+    spilcd_clear(WHITE);
+    spilcd_show_string(10, 10, spilcddev.width - 20, 20, 16, "Connecting...", BLACK);
+    spilcd_show_string(10, 40, spilcddev.width - 20, 20, 16, "WiFi...", BLACK);
+    
+    ret = wifi_tcp_client_start();
+    if (ret != ESP_OK) {
+        printf("Failed to start WiFi TCP client\n");
+        spilcd_show_string(10, 70, spilcddev.width - 20, 20, 16, "WiFi Failed!", BLACK);
+    } else {
+        printf("WiFi TCP client started successfully\n");
+    }
+
     // 分配接收缓冲区（使用uart.h中定义的RX_BUF_SIZE）
     rx_buffer = (char *)malloc(RX_BUF_SIZE + 1);
     if (rx_buffer == NULL) {
         printf("Failed to allocate RX buffer\n");
         return;
     }
-
-    // 初始显示提示信息（白底黑字）
-    spilcd_clear(WHITE);
-    spilcd_show_string(10, 10, spilcddev.width - 20, 20, 16, "Last UART Data:", BLACK);
-    spilcd_show_string(10, 40, spilcddev.width - 20, 20, 16, "Waiting...", BLACK);
 
     while(1)
     {
@@ -162,6 +207,18 @@ void app_main(void)
                 
                 // 回显接收到的数据（只在接收到数据时才回复）
                 uart_write_bytes(USART_UX, rx_buffer, bytes_read);
+                
+                // 通过WiFi TCP发送数据到服务器
+                if (tcp_is_connected()) {
+                    int sent = wifi_tcp_send((uint8_t *)rx_buffer, bytes_read);
+                    if (sent > 0) {
+                        printf("[TCP] Sent %d bytes to server\n", sent);
+                    } else {
+                        printf("[TCP] Failed to send data\n");
+                    }
+                } else {
+                    printf("[TCP] Not connected, cannot send data\n");
+                }
                 
                 // 保存最后接收到的数据（限制为DISPLAY_BUF_SIZE用于LCD显示）
                 strncpy(last_rx_data, rx_buffer, DISPLAY_BUF_SIZE);
