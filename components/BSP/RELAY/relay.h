@@ -4,6 +4,7 @@
  * @brief       继电器控制模块头文件
  * @details     控制两路继电器(IO16/IO18)，实现电机正反转控制
  *              两路IO输出互补（相反），每8秒自动切换一次
+ *              支持RTC内存保存状态，看门狗复位后恢复运行位置
  ******************************************************************************
  */
 
@@ -13,13 +14,33 @@
 #include "driver/gpio.h"
 #include "esp_err.h"
 #include <stdbool.h>
+#include <stdint.h>
 
 /* 继电器控制IO口定义 */
 #define RELAY1_IO          GPIO_NUM_16      /* 继电器1 - 电机正转 */
 #define RELAY2_IO          GPIO_NUM_18      /* 继电器2 - 电机反转 */
 
 /* 继电器切换周期（单位：毫秒） */
-#define RELAY_TOGGLE_PERIOD_MS   8000       /* 8秒切换一次 */
+#define RELAY_FORWARD_PERIOD_MS    3000       /* 正转时间：8秒 */
+#define RELAY_REVERSE_PERIOD_MS    1000       /* 反转时间：8秒 */
+// #define RELAY_TOGGLE_PERIOD_MS     8000       /* 兼容旧代码，默认使用正转时间 */
+
+/* RTC内存魔术字，用于验证数据有效性 */
+#define RELAY_RTC_MAGIC    0x52454C41      /* "RELA" */
+
+/**
+ * @brief       RTC内存中保存的继电器状态结构
+ */
+typedef struct {
+    uint32_t magic;               /* 魔术字，用于验证数据有效性 */
+    bool relay1_state;            /* IO16的电平状态 */
+    bool relay2_state;            /* IO18的电平状态 */
+    uint32_t timer_count_ms;      /* 当前周期的运行时间（毫秒） */
+    uint32_t cycle_count;         /* 完成的周期数 */
+    bool paused;                  /* 暂停状态 */
+    uint32_t reset_cause;         /* 复位原因：0=正常启动, 1=看门狗复位, 2=按键复位 */
+    uint32_t checksum;            /* 校验和，用于数据完整性检查 */
+} relay_rtc_state_t;
 
 /* 函数声明 */
 esp_err_t relay_init(void);                             /* 初始化继电器 */
@@ -32,5 +53,17 @@ void relay_pause(void);                                 /* 暂停继电器控制
 void relay_resume(void);                                /* 恢复继电器控制 */
 bool relay_is_paused(void);                             /* 检查是否处于暂停状态 */
 void relay_stop_all(void);                              /* 停止所有继电器输出 */
+
+/* 动态配置函数 */
+void relay_set_forward_period(uint32_t period_ms);      /* 设置正转时间（毫秒） */
+void relay_set_reverse_period(uint32_t period_ms);      /* 设置反转时间（毫秒） */
+uint32_t relay_get_forward_period(void);                /* 获取正转时间（毫秒） */
+uint32_t relay_get_reverse_period(void);                /* 获取反转时间（毫秒） */
+
+/* RTC内存相关函数 */
+void relay_save_to_rtc(void);                           /* 保存状态到RTC内存 */
+bool relay_restore_from_rtc(uint32_t reset_cause);      /* 从RTC内存恢复状态 */
+void relay_clear_rtc_state(void);                       /* 清除RTC内存中的状态 */
+relay_rtc_state_t* relay_get_rtc_state_ptr(void);       /* 获取RTC状态指针 */
 
 #endif

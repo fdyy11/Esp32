@@ -4,17 +4,24 @@
  * @brief       继电器控制模块实现文件
  * @details     控制两路继电器(IO16/IO18)，实现电机正反转控制
  *              两路IO输出互补（相反），每8秒自动切换一次
+ *              支持RTC内存保存状态，看门狗复位后恢复运行位置
  ******************************************************************************
  */
 
 #include "relay.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include <string.h>
 
 static const char *TAG = "RELAY";
 
-/* 继电器1当前状态 */
+/* RTC慢速内存区域，用于保存继电器状态（断电后数据丢失，但复位后保留） */
+// 使用RTC_DATA_ATTR宏将变量放在RTC慢速内存中
+RTC_DATA_ATTR static relay_rtc_state_t s_rtc_relay_state = {0};
+
+/* �继电器1当前状态 */
 static bool s_relay1_state = false;
 
 /* 定时器计数器（毫秒） */
@@ -28,6 +35,48 @@ static bool s_paused = false;
 
 /* 暂停时保存的定时器计数值 */
 static uint32_t s_saved_timer_count_ms = 0;
+
+/* 可配置的正转和反转周期（毫秒） */
+static uint32_t s_forward_period_ms = RELAY_FORWARD_PERIOD_MS;
+static uint32_t s_reverse_period_ms = RELAY_REVERSE_PERIOD_MS;
+
+/**
+ * @brief       计算校验和
+ * @param       state: 状态结构指针
+ * @retval      校验和值
+ */
+static uint32_t calculate_checksum(const relay_rtc_state_t *state)
+{
+    uint32_t checksum = 0;
+    checksum ^= state->magic;
+    checksum ^= (state->relay1_state ? 1 : 0);
+    checksum ^= (state->relay2_state ? 1 : 0);
+    checksum ^= state->timer_count_ms;
+    checksum ^= state->cycle_count;
+    checksum ^= (state->paused ? 1 : 0);
+    checksum ^= state->reset_cause;
+    return checksum;
+}
+
+/**
+ * @brief       验证RTC数据的完整性
+ * @retval      true:数据有效, false:数据无效
+ */
+static bool validate_rtc_data(void)
+{
+    if (s_rtc_relay_state.magic != RELAY_RTC_MAGIC) {
+        return false;
+    }
+    
+    uint32_t expected_checksum = calculate_checksum(&s_rtc_relay_state);
+    if (s_rtc_relay_state.checksum != expected_checksum) {
+        ESP_LOGW(TAG, "RTC data checksum mismatch: expected=0x%08X, actual=0x%08X",
+                 expected_checksum, s_rtc_relay_state.checksum);
+        return false;
+    }
+    
+    return true;
+}
 
 /**
  * @brief       初始化继电器
@@ -69,7 +118,7 @@ void relay_set_state(bool relay1_on)
     gpio_set_level(RELAY1_IO, relay1_on ? 1 : 0);
     gpio_set_level(RELAY2_IO, relay1_on ? 0 : 1);
 
-    ESP_LOGI(TAG, "Relay state changed: IO16=%d, IO18=%d (Motor %s)",
+    ESP_LOGD(TAG, "Relay state changed: IO16=%d, IO18=%d (Motor %s)",
              relay1_on ? 1 : 0,
              relay1_on ? 0 : 1,
              relay1_on ? "FORWARD" : "REVERSE");
@@ -103,11 +152,13 @@ uint32_t relay_get_cycle_count(void)
 
 /**
  * @brief       继电器任务处理函数（需要在主循环中周期调用）
- * @details     每8秒自动切换一次IO输出
- *              每完成一个完整周期（IO16: LOW->HIGH->LOW，共16秒）计数加1
+ * @details     根据当前状态使用不同的定时周期
+ *              - 正转状态(IO16=HIGH): 使用RELAY_FORWARD_PERIOD_MS
+ *              - 反转状态(IO16=LOW): 使用RELAY_REVERSE_PERIOD_MS
+ *              每完成一个完整周期（IO16: LOW->HIGH->LOW）计数加1
  * @param       无
- * @retval      true:完成了一个完整周期(16s), false:无完整周期
- * @note        调用间隔建议为10ms，内部使用计数器实现8秒定时
+ * @retval      true:完成了一个完整周期, false:无完整周期
+ * @note        调用间隔建议为10ms，内部使用计数器实现定时
  */
 bool relay_task_handler(void)
 {
@@ -120,12 +171,15 @@ bool relay_task_handler(void)
 
     s_timer_count_ms += 10;  /* 每次调用增加10ms（需保证调用间隔为10ms） */
 
-    if (s_timer_count_ms >= RELAY_TOGGLE_PERIOD_MS)
+    /* 根据当前状态选择不同的切换周期 */
+    uint32_t current_period = s_relay1_state ? s_forward_period_ms : s_reverse_period_ms;
+
+    if (s_timer_count_ms >= current_period)
     {
         s_timer_count_ms = 0;
         relay_toggle();
 
-        /* 只有当IO16回到LOW状态时，才算完成一个完整周期（LOW->HIGH->LOW = 16s） */
+        /* 只有当IO16回到LOW状态时，才算完成一个完整周期（LOW->HIGH->LOW） */
         if (!s_relay1_state)
         {
             s_cycle_count++;
@@ -134,7 +188,7 @@ bool relay_task_handler(void)
         }
         else
         {
-            ESP_LOGI(TAG, "Relay toggled (half cycle), IO16=HIGH");
+            ESP_LOGD(TAG, "Relay toggled (half cycle), IO16=HIGH");
         }
     }
 
@@ -189,4 +243,142 @@ void relay_stop_all(void)
     gpio_set_level(RELAY1_IO, 0);
     gpio_set_level(RELAY2_IO, 0);
     ESP_LOGI(TAG, "All relays stopped (IO16=0, IO18=0)");
+}
+
+/**
+ * @brief       保存继电器状态到RTC内存
+ * @details     在每次状态变化或定期调用此函数，以便复位后恢复
+ */
+void relay_save_to_rtc(void)
+{
+    s_rtc_relay_state.magic = RELAY_RTC_MAGIC;
+    s_rtc_relay_state.relay1_state = s_relay1_state;
+    s_rtc_relay_state.relay2_state = !s_relay1_state;  // 互补状态
+    s_rtc_relay_state.timer_count_ms = s_timer_count_ms;
+    s_rtc_relay_state.cycle_count = s_cycle_count;
+    s_rtc_relay_state.paused = s_paused;
+    // reset_cause由main.c设置
+    s_rtc_relay_state.checksum = calculate_checksum(&s_rtc_relay_state);
+    
+    ESP_LOGD(TAG, "State saved to RTC: relay1=%d, timer=%lu ms, cycles=%lu",
+             s_relay1_state, s_timer_count_ms, s_cycle_count);
+}
+
+/**
+ * @brief       从RTC内存恢复继电器状态
+ * @param       reset_cause: 复位原因（0=正常启动, 1=看门狗复位, 2=按键复位）
+ * @retval      true:恢复成功, false:恢复失败（数据无效或非看门狗复位）
+ * @note        仅在看门狗复位时恢复状态，其他情况重新开始
+ */
+bool relay_restore_from_rtc(uint32_t reset_cause)
+{
+    ESP_LOGI(TAG, "Checking RTC state... Reset cause: %lu", reset_cause);
+    
+    // 首先验证数据完整性
+    if (!validate_rtc_data()) {
+        ESP_LOGW(TAG, "RTC data invalid or not initialized");
+        return false;
+    }
+    
+    // 仅在看门狗复位时恢复状态
+    if (reset_cause != 1) {  // 1表示看门狗复位
+        ESP_LOGI(TAG, "Not watchdog reset (cause=%lu), starting fresh", reset_cause);
+        return false;
+    }
+    
+    // 恢复状态
+    s_relay1_state = s_rtc_relay_state.relay1_state;
+    s_timer_count_ms = s_rtc_relay_state.timer_count_ms;
+    s_cycle_count = s_rtc_relay_state.cycle_count;
+    s_paused = s_rtc_relay_state.paused;
+    
+    // 如果之前是暂停状态，保存定时器计数
+    if (s_paused) {
+        s_saved_timer_count_ms = s_timer_count_ms;
+    }
+    
+    // 应用恢复的状态到GPIO
+    gpio_set_level(RELAY1_IO, s_relay1_state ? 1 : 0);
+    gpio_set_level(RELAY2_IO, s_relay1_state ? 0 : 1);
+    
+    ESP_LOGI(TAG, "=== RESTORED FROM RTC MEMORY ===");
+    ESP_LOGI(TAG, "  Relay1 State: %d (%s)", 
+             s_relay1_state, s_relay1_state ? "FORWARD" : "REVERSE");
+    ESP_LOGI(TAG, "  Timer Count: %lu ms", s_timer_count_ms);
+    ESP_LOGI(TAG, "  Cycle Count: %lu", s_cycle_count);
+    ESP_LOGI(TAG, "  Paused: %d", s_paused);
+    ESP_LOGI(TAG, "===============================");
+    
+    return true;
+}
+
+/**
+ * @brief       清除RTC内存中的状态
+ * @details     在正常启动或按键复位时调用
+ */
+void relay_clear_rtc_state(void)
+{
+    memset(&s_rtc_relay_state, 0, sizeof(relay_rtc_state_t));
+    ESP_LOGI(TAG, "RTC state cleared");
+}
+
+/**
+ * @brief       获取RTC状态指针（用于更新reset_cause）
+ * @retval      RTC状态结构指针
+ */
+relay_rtc_state_t* relay_get_rtc_state_ptr(void)
+{
+    return &s_rtc_relay_state;
+}
+
+/**
+ * @brief       设置正转时间
+ * @param       period_ms: 正转时间（毫秒）
+ * @note        最小值建议100ms，避免频繁切换
+ */
+void relay_set_forward_period(uint32_t period_ms)
+{
+    if (period_ms < 100) {
+        ESP_LOGW(TAG, "Forward period too short, set to minimum 100ms");
+        s_forward_period_ms = 100;
+    } else {
+        s_forward_period_ms = period_ms;
+    }
+    ESP_LOGI(TAG, "Forward period set to %lu ms (%.1f s)", 
+             s_forward_period_ms, s_forward_period_ms / 1000.0);
+}
+
+/**
+ * @brief       设置反转时间
+ * @param       period_ms: 反转时间（毫秒）
+ * @note        最小值建议100ms，避免频繁切换
+ */
+void relay_set_reverse_period(uint32_t period_ms)
+{
+    if (period_ms < 100) {
+        ESP_LOGW(TAG, "Reverse period too short, set to minimum 100ms");
+        s_reverse_period_ms = 100;
+    } else {
+        s_reverse_period_ms = period_ms;
+    }
+    ESP_LOGI(TAG, "Reverse period set to %lu ms (%.1f s)", 
+             s_reverse_period_ms, s_reverse_period_ms / 1000.0);
+}
+
+/**
+ * @brief       获取正转时间
+ * @retval      正转时间（毫秒）
+ */
+uint32_t relay_get_forward_period(void)
+{
+    return s_forward_period_ms;
+}
+
+/**
+ * @brief       获取反转时间
+ * @retval      反转时间（毫秒）
+ */
+uint32_t relay_get_reverse_period(void)
+{
+    return s_reverse_period_ms;
 }

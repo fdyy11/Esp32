@@ -23,7 +23,7 @@ extern "C" {
 #define WIFI_MAXIMUM_RETRY  5                    // 最大重连次数
 
 /* TCP服务器配置参数 */
-#define TCP_SERVER_IP       "192.168.82.9"     // TCP服务器IP地址，请修改为你的服务器IP
+#define TCP_SERVER_IP       "192.168.82.43"     // TCP服务器IP地址，请修改为你的服务器IP
 #define TCP_SERVER_PORT     7070                 // TCP服务器端口号
 
 /* WiFi事件定义 */

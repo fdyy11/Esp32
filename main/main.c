@@ -2,9 +2,9 @@
  ******************************************************************************
  * @file        main.c
  * @author      正点原子团队(ALIENTEK)
- * @version     V1.0
+ * @version     V1.1 (增加看门狗自动复位功能)
  * @date        2025-01-01
- * @brief       UART实验（增加WiFi TCP客户端功能 + 继电器控制）
+ * @brief       UART实验（增加WiFi TCP客户端功能 + 继电器控制 + 看门狗保护）
  * @license     Copyright (c) 2020-2032, 广州市星翼电子科技有限公司
  ******************************************************************************
  * @attention
@@ -14,6 +14,12 @@
  * 技术论坛:www.openedv.com
  * 公司网址:www.alientek.com
  * 购买地址:openedv.taobao.com
+ * 
+ * 看门狗配置说明：
+ * - 必须确保 CONFIG_ESP_TASK_WDT_PANIC=n
+ * - 必须确保 CONFIG_ESP_TASK_WDT_RESET_CPU=y
+ * - 否则看门狗超时不会自动复位系统
+ * - 运行 idf.py menuconfig 修改配置
  ******************************************************************************
  */
 
@@ -21,6 +27,7 @@
 #include "freertos/task.h"
 #include "esp_task_wdt.h"
 #include "esp_timer.h"
+#include "esp_system.h"
 #include "nvs_flash.h"
 #include <stdio.h>
 #include <string.h>
@@ -107,6 +114,53 @@ void app_main(void)
     };
 
     printf("=== System Starting ===\n");
+    
+    // 检测复位原因
+    esp_reset_reason_t reset_reason = esp_reset_reason();
+    uint32_t rtc_reset_cause = 0;  // 0=正常启动
+    
+    switch (reset_reason) {
+        case ESP_RST_POWERON:
+            printf("[RESET] Power-on reset - Starting fresh\n");
+            rtc_reset_cause = 0;
+            break;
+        case ESP_RST_SW:
+            printf("[RESET] Software reset - Starting fresh\n");
+            rtc_reset_cause = 0;
+            break;
+        case ESP_RST_PANIC:
+            printf("[RESET] Panic reset - May be watchdog timeout\n");
+            rtc_reset_cause = 1;  // 看门狗复位
+            break;
+        case ESP_RST_INT_WDT:
+            printf("[RESET] Interrupt watchdog reset\n");
+            rtc_reset_cause = 1;  // 看门狗复位
+            break;
+        case ESP_RST_TASK_WDT:
+            printf("[RESET] Task watchdog reset - Will restore state\n");
+            rtc_reset_cause = 1;  // 看门狗复位
+            break;
+        case ESP_RST_WDT:
+            printf("[RESET] Other watchdog reset\n");
+            rtc_reset_cause = 1;  // 看门狗复位
+            break;
+        case ESP_RST_DEEPSLEEP:
+            printf("[RESET] Deep sleep reset\n");
+            rtc_reset_cause = 0;
+            break;
+        case ESP_RST_BROWNOUT:
+            printf("[RESET] Brownout reset\n");
+            rtc_reset_cause = 0;
+            break;
+        case ESP_RST_SDIO:
+            printf("[RESET] SDIO reset\n");
+            rtc_reset_cause = 0;
+            break;
+        default:
+            printf("[RESET] Unknown reset reason (%d)\n", reset_reason);
+            rtc_reset_cause = 0;
+            break;
+    }
 
     // 初始化WiFi TCP客户端（包含NVS初始化）
     printf("Initializing WiFi TCP client...\n");
@@ -137,17 +191,50 @@ void app_main(void)
     // 初始化继电器控制模块
     relay_init();                   /* 初始化继电器(IO16/IO18) */
     printf("Relay initialized: IO16=RELAY1(FWD), IO18=RELAY2(REV)\n");
+    
+    // 尝试从RTC内存恢复状态（仅在看门狗复位时）
+    bool restored = relay_restore_from_rtc(rtc_reset_cause);
+    
+    if (restored) {
+        printf("[RTC] Successfully restored relay state from RTC memory\n");
+        
+        // 更新RTC状态中的复位原因
+        relay_rtc_state_t *rtc_state = relay_get_rtc_state_ptr();
+        rtc_state->reset_cause = rtc_reset_cause;
+        relay_save_to_rtc();
+        
+        // 在LCD上显示恢复信息
+        spilcd_clear(WHITE);
+        spilcd_show_string(10, 10, spilcddev.width - 20, 20, 16, "RESTORED", BLACK);
+        char restore_str[64];
+        snprintf(restore_str, sizeof(restore_str), "Cycle: %lu", relay_get_cycle_count());
+        spilcd_show_string(10, 40, spilcddev.width - 20, 20, 16, restore_str, BLACK);
+        vTaskDelay(pdMS_TO_TICKS(2000));  // 显示2秒
+    } else {
+        printf("[RTC] Starting with fresh state\n");
+        
+        // 清除RTC状态（非看门狗复位）
+        relay_clear_rtc_state();
+        
+        // 在LCD上显示启动信息
+        spilcd_clear(WHITE);
+        spilcd_show_string(10, 10, spilcddev.width - 20, 20, 16, "System Ready", BLACK);
+        spilcd_show_string(10, 40, spilcddev.width - 20, 20, 16, "Fresh Start", BLACK);
+    }
 
     // 启动WiFi和TCP连接（这会阻塞直到连接成功或失败）
     printf("Starting WiFi connection...\n");
-    spilcd_clear(WHITE);
-    spilcd_show_string(10, 10, spilcddev.width - 20, 20, 16, "Connecting...", BLACK);
-    spilcd_show_string(10, 40, spilcddev.width - 20, 20, 16, "WiFi...", BLACK);
+    if (!restored) {  // 仅在未恢复状态时显示连接中
+        spilcd_show_string(10, 70, spilcddev.width - 20, 20, 16, "Connecting...", BLACK);
+        spilcd_show_string(10, 100, spilcddev.width - 20, 20, 16, "WiFi...", BLACK);
+    }
     
     ret = wifi_tcp_client_start();
     if (ret != ESP_OK) {
         printf("Failed to start WiFi TCP client\n");
-        spilcd_show_string(10, 70, spilcddev.width - 20, 20, 16, "WiFi Failed!", BLACK);
+        if (!restored) {
+            spilcd_show_string(10, 130, spilcddev.width - 20, 20, 16, "WiFi Failed!", BLACK);
+        }
     } else {
         printf("WiFi TCP client started successfully\n");
     }
@@ -166,7 +253,19 @@ void app_main(void)
     esp_err_t wdt_ret = esp_task_wdt_add(NULL);
     if (wdt_ret == ESP_OK) {
         printf("Task watchdog monitoring enabled for main task\n");
-        printf("Note: Ensure CONFIG_ESP_TASK_WDT_TIMEOUT_S is set appropriately in menuconfig\n");
+        printf("Watchdog timeout: %d seconds\n", CONFIG_ESP_TASK_WDT_TIMEOUT_S);
+        
+        // 检查看门狗配置是否正确
+#ifdef CONFIG_ESP_TASK_WDT_PANIC
+        printf("[WARNING] Watchdog is configured to PANIC instead of RESET!\n");
+        printf("[WARNING] This means the system will NOT automatically reboot on timeout.\n");
+        printf("[INFO] Please run 'idf.py menuconfig' and change:\n");
+        printf("[INFO]   Component config -> ESP System Settings -> Task Watchdog Timer\n");
+        printf("[INFO]   Disable 'Invoke panic handler on timeout'\n");
+        printf("[INFO]   Enable 'Reset CPU on timeout'\n");
+#else
+        printf("Watchdog will reset CPU on timeout (correct configuration)\n");
+#endif
     } else {
         printf("Warning: Failed to add task to watchdog: %s\n", esp_err_to_name(wdt_ret));
     }
@@ -197,6 +296,11 @@ void app_main(void)
     const uint32_t MAX_TCP_RECONNECT_ATTEMPTS = 5;
     uint64_t last_tcp_reconnect_time = 0;
     const uint64_t TCP_RECONNECT_BACKOFF_US = 10000000; // 10秒退避时间
+    
+    // 系统健康监控
+    uint64_t system_start_time = esp_timer_get_time();
+    uint32_t consecutive_failures = 0; // 连续失败计数
+    const uint32_t MAX_CONSECUTIVE_FAILURES = 100; // 最大连续失败次数（约1秒）
 
     while(1)
     {
@@ -207,14 +311,30 @@ void app_main(void)
             UBaseType_t stack_watermark = uxTaskGetStackHighWaterMark(NULL);
             size_t free_heap = heap_caps_get_free_size(MALLOC_CAP_8BIT);
             size_t min_free_heap = heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT);
+            uint64_t current_time = esp_timer_get_time();
+            uint64_t elapsed_seconds = (current_time - system_start_time) / 1000000;
             
-            printf("[DIAG] Loop=%lu, Stack=%u words (%u bytes), FreeHeap=%u, MinFreeHeap=%u\n",
-                   loop_count, stack_watermark, stack_watermark * sizeof(StackType_t), 
+            printf("[DIAG] Loop=%lu, Elapsed=%llu s, Stack=%u words (%u bytes), FreeHeap=%u, MinFreeHeap=%u\n",
+                   loop_count, elapsed_seconds, stack_watermark, stack_watermark * sizeof(StackType_t), 
                    free_heap, min_free_heap);
             printf("[DIAG] Max operation times: I2C=%lu us, TCP=%lu us, SPI=%lu us\n",
                    max_i2c_time, max_tcp_time, max_spi_time);
-            printf("[DIAG] TCP connected=%d, Relay cycles=%ld, Paused=%d\n",
-                   tcp_is_connected(), relay_get_cycle_count(), relay_is_paused());
+            printf("[DIAG] TCP connected=%d, Relay cycles=%ld, Paused=%d, Failures=%lu\n",
+                   tcp_is_connected(), relay_get_cycle_count(), relay_is_paused(), consecutive_failures);
+            
+            // 检查系统健康状态
+            if (stack_watermark < 512) { // 栈空间小于2KB
+                printf("[CRITICAL] Stack space critically low! %u words remaining\n", stack_watermark);
+            }
+            if (free_heap < 10240) { // 堆空间小于10KB
+                printf("[CRITICAL] Heap space critically low! %u bytes remaining\n", free_heap);
+            }
+            if (consecutive_failures > MAX_CONSECUTIVE_FAILURES) {
+                printf("[CRITICAL] Too many consecutive failures (%lu). Triggering system reset...\n", consecutive_failures);
+                printf("[CRITICAL] System will reboot in 3 seconds...\n");
+                vTaskDelay(pdMS_TO_TICKS(3000));
+                esp_restart(); // 触发系统复位
+            }
             
             last_diag_loop = loop_count;
         }
@@ -242,6 +362,9 @@ void app_main(void)
             if (!relay_is_paused()) {
                 // 执行暂停操作
                 relay_pause();
+                
+                // 保存状态到RTC内存
+                relay_save_to_rtc();
                 
                 // 更新LCD显示
                 spilcd_clear(WHITE);
@@ -301,6 +424,9 @@ void app_main(void)
             if (relay_is_paused()) {
                 // 执行恢复操作
                 relay_resume();
+                
+                // 保存状态到RTC内存
+                relay_save_to_rtc();
                 
                 // 标记需要更新LCD显示
                 lcd_need_update = true;
@@ -368,6 +494,14 @@ void app_main(void)
             
             // 标记需要更新LCD显示
             lcd_need_update = true;
+            
+            // 保存状态到RTC内存（每个周期完成后保存）
+            relay_save_to_rtc();
+        }
+        
+        // ===== 定期保存状态到RTC内存（每100次循环约1秒保存一次）=====
+        if (loop_count % 100 == 0 && !relay_is_paused()) {
+            relay_save_to_rtc();
         }
         
         // ===== LCD显示更新（仅在状态变化时更新，避免频繁刷新）=====
