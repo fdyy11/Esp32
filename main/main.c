@@ -19,9 +19,12 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "esp_task_wdt.h"
+#include "esp_timer.h"
 #include "nvs_flash.h"
 #include <stdio.h>
 #include <string.h>
+#include <errno.h>
 #include "ledc.h"
 #include "uart.h"
 #include "spilcd.h"
@@ -35,6 +38,15 @@
 #define DISPLAY_BUF_SIZE 128
 static char last_rx_data[DISPLAY_BUF_SIZE + 1] = {0};
 static bool has_new_data = false;
+
+// 按键状态跟踪变量
+static uint8_t last_key0_state = 1;
+static uint8_t last_key1_state = 1;
+
+// LCD状态跟踪变量（用于避免不必要的刷新）
+static bool lcd_initialized = false;
+static bool last_relay_state = false;
+static long last_cycle_count = 0;
 
 /**
  * @brief       WiFi事件回调函数
@@ -147,13 +159,182 @@ void app_main(void)
         return;
     }
 
+    // 初始化看门狗（在所有硬件初始化完成后启用）
+    printf("Initializing Task Watchdog Timer...\n");
+    
+    // 将当前任务添加到看门狗监控列表
+    esp_err_t wdt_ret = esp_task_wdt_add(NULL);
+    if (wdt_ret == ESP_OK) {
+        printf("Task watchdog monitoring enabled for main task\n");
+        printf("Note: Ensure CONFIG_ESP_TASK_WDT_TIMEOUT_S is set appropriately in menuconfig\n");
+    } else {
+        printf("Warning: Failed to add task to watchdog: %s\n", esp_err_to_name(wdt_ret));
+    }
+    
+    // 打印初始栈空间信息，用于诊断
+    UBaseType_t stack_watermark = uxTaskGetStackHighWaterMark(NULL);
+    printf("[DIAG] Initial stack watermark: %u words (%u bytes)\n", 
+           stack_watermark, stack_watermark * sizeof(StackType_t));
+    
     // 初始化LCD显示
     spilcd_clear(WHITE);
     spilcd_show_string(10, 10, spilcddev.width - 20, 20, 16, "System Ready", BLACK);
     spilcd_show_string(10, 40, spilcddev.width - 20, 20, 16, "Relay Ctrl Active", BLACK);
 
+    // 继电器状态跟踪变量已在文件顶部声明为全局变量
+    bool lcd_need_update = true; // 首次需要更新显示
+    
+    // 诊断计数器
+    uint32_t loop_count = 0;
+    uint32_t last_diag_loop = 0;
+    
+    // 关键操作耗时跟踪
+    uint64_t i2c_start_time, tcp_start_time, spi_start_time;
+    uint32_t max_i2c_time = 0, max_tcp_time = 0, max_spi_time = 0;
+    
+    // TCP重连控制
+    uint32_t tcp_reconnect_attempts = 0;
+    const uint32_t MAX_TCP_RECONNECT_ATTEMPTS = 5;
+    uint64_t last_tcp_reconnect_time = 0;
+    const uint64_t TCP_RECONNECT_BACKOFF_US = 10000000; // 10秒退避时间
+
     while(1)
     {
+        loop_count++;
+        
+        // ===== 定期诊断（每1000次循环，约10秒输出一次）=====
+        if (loop_count - last_diag_loop >= 1000) {
+            UBaseType_t stack_watermark = uxTaskGetStackHighWaterMark(NULL);
+            size_t free_heap = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+            size_t min_free_heap = heap_caps_get_minimum_free_size(MALLOC_CAP_8BIT);
+            
+            printf("[DIAG] Loop=%lu, Stack=%u words (%u bytes), FreeHeap=%u, MinFreeHeap=%u\n",
+                   loop_count, stack_watermark, stack_watermark * sizeof(StackType_t), 
+                   free_heap, min_free_heap);
+            printf("[DIAG] Max operation times: I2C=%lu us, TCP=%lu us, SPI=%lu us\n",
+                   max_i2c_time, max_tcp_time, max_spi_time);
+            printf("[DIAG] TCP connected=%d, Relay cycles=%ld, Paused=%d\n",
+                   tcp_is_connected(), relay_get_cycle_count(), relay_is_paused());
+            
+            last_diag_loop = loop_count;
+        }
+        
+        // ===== 喂看门狗（每次循环开始就喂狗）=====
+        esp_task_wdt_reset();
+        
+        // ===== KEY0按键检测（暂停功能）=====
+        i2c_start_time = esp_timer_get_time();
+        uint8_t key0_state = xl9555_pin_read(KEY0_IO);
+        
+        // 喂狗（I2C读取后）
+        esp_task_wdt_reset();
+        
+        // 记录I2C操作耗时
+        uint32_t i2c_time = (uint32_t)(esp_timer_get_time() - i2c_start_time);
+        if (i2c_time > max_i2c_time) {
+            max_i2c_time = i2c_time;
+        }
+
+        if (key0_state == 0 && last_key0_state == 1) {
+            // KEY0按下（下降沿触发）
+            printf("[KEY0] Pause button pressed\n");
+            
+            if (!relay_is_paused()) {
+                // 执行暂停操作
+                relay_pause();
+                
+                // 更新LCD显示
+                spilcd_clear(WHITE);
+                spilcd_show_string(10, 10, spilcddev.width - 20, 20, 16, "PAUSED", BLACK);
+                char cycle_str[32];
+                snprintf(cycle_str, sizeof(cycle_str), "Cycles: %ld", relay_get_cycle_count());
+                spilcd_show_string(10, 40, spilcddev.width - 20, 20, 16, cycle_str, BLACK);
+                
+                // 通过TCP发送暂停通知（带超时保护和非阻塞检查）
+                if (tcp_is_connected()) {
+                    const char *pause_msg = "RELAY_PAUSED";
+                    tcp_start_time = esp_timer_get_time();
+                    int sent = wifi_tcp_send((uint8_t *)pause_msg, strlen(pause_msg));
+                    
+                    // 记录TCP操作耗时
+                    uint32_t tcp_time = (uint32_t)(esp_timer_get_time() - tcp_start_time);
+                    if (tcp_time > max_tcp_time) {
+                        max_tcp_time = tcp_time;
+                    }
+                    
+                    // 喂狗（TCP发送后）
+                    esp_task_wdt_reset();
+                    
+                    if (sent <= 0) {
+                        printf("[TCP] Failed to send pause notification (errno=%d, time=%lu us)\n", errno, tcp_time);
+                        // 标记TCP需要重连
+                        tcp_reconnect_attempts = 0;
+                        last_tcp_reconnect_time = esp_timer_get_time();
+                    }
+                }
+
+                // LED熄灭
+                gpio_set_level(LED0_GPIO_PIN, 0);
+                
+                lcd_need_update = false; // 暂停状态下不需要再更新
+            }
+        }
+        last_key0_state = key0_state;
+        
+        // ===== KEY1按键检测（恢复功能）=====
+        i2c_start_time = esp_timer_get_time();
+        uint8_t key1_state = xl9555_pin_read(KEY1_IO);
+        
+        // 喂狗（I2C读取后）
+        esp_task_wdt_reset();
+        
+        // 记录I2C操作耗时
+        i2c_time = (uint32_t)(esp_timer_get_time() - i2c_start_time);
+        if (i2c_time > max_i2c_time) {
+            max_i2c_time = i2c_time;
+        }
+
+        if (key1_state == 0 && last_key1_state == 1) {
+            // KEY1按下（下降沿触发）
+            printf("[KEY1] Resume button pressed\n");
+            
+            if (relay_is_paused()) {
+                // 执行恢复操作
+                relay_resume();
+                
+                // 标记需要更新LCD显示
+                lcd_need_update = true;
+                
+                // 通过TCP发送恢复通知（带超时保护）
+                if (tcp_is_connected()) {
+                    const char *resume_msg = "RELAY_RESUMED";
+                    tcp_start_time = esp_timer_get_time();
+                    int sent = wifi_tcp_send((uint8_t *)resume_msg, strlen(resume_msg));
+                    
+                    // 记录TCP操作耗时
+                    uint32_t tcp_time = (uint32_t)(esp_timer_get_time() - tcp_start_time);
+                    if (tcp_time > max_tcp_time) {
+                        max_tcp_time = tcp_time;
+                    }
+                    
+                    // 喂狗（TCP发送后）
+                    esp_task_wdt_reset();
+                    
+                    if (sent <= 0) {
+                        printf("[TCP] Failed to send resume notification (errno=%d, time=%lu us)\n", errno, tcp_time);
+                        tcp_reconnect_attempts = 0;
+                        last_tcp_reconnect_time = esp_timer_get_time();
+                    }
+                }
+
+                // LED熄灭
+                gpio_set_level(LED0_GPIO_PIN, 0);
+                
+                lcd_need_update = false; // 暂停状态下不需要再更新
+            }
+        }
+        last_key1_state = key1_state;
+        
         // ===== 继电器定时切换逻辑（每8秒反转一次IO输出）=====
         if (relay_task_handler())
         {
@@ -164,31 +345,110 @@ void app_main(void)
                                        "已完成%ld次收展", 
                                        relay_get_cycle_count());
                 
+                tcp_start_time = esp_timer_get_time();
                 int sent = wifi_tcp_send((uint8_t *)tcp_msg, msg_len);
+                
+                // 记录TCP操作耗时
+                uint32_t tcp_time = (uint32_t)(esp_timer_get_time() - tcp_start_time);
+                if (tcp_time > max_tcp_time) {
+                    max_tcp_time = tcp_time;
+                }
+                
+                // 喂狗（TCP发送后）
+                esp_task_wdt_reset();
+                
                 if (sent > 0) {
                     printf("[TCP] Sent cycle notification: %s\n", tcp_msg);
                 } else {
-                    printf("[TCP] Failed to send cycle notification\n");
+                    printf("[TCP] Failed to send cycle notification (errno=%d, time=%lu us)\n", errno, tcp_time);
                 }
             } else {
                 printf("[TCP] Not connected, cannot send cycle notification\n");
             }
             
-            // 更新LCD显示当前状态
-            spilcd_clear(WHITE);
-            if (relay_get_state()) {
-                spilcd_show_string(10, 10, spilcddev.width - 20, 20, 16, "Motor: FORWARD", BLACK);
-            } else {
-                spilcd_show_string(10, 10, spilcddev.width - 20, 20, 16, "Motor: REVERSE", BLACK);
-            }
-            char cycle_str[32];
-            snprintf(cycle_str, sizeof(cycle_str), "Cycles: %ld", relay_get_cycle_count());
-            spilcd_show_string(10, 40, spilcddev.width - 20, 20, 16, cycle_str, BLACK);
+            // 标记需要更新LCD显示
+            lcd_need_update = true;
         }
         
-        // ===== LED指示灯逻辑（与IO16输出同步）=====
-        // IO16输出高电平时LED亮，低电平时LED灭
-        gpio_set_level(LED0_GPIO_PIN, relay_get_state() ? 1 : 0);
+        // ===== LCD显示更新（仅在状态变化时更新，避免频繁刷新）=====
+        if (lcd_need_update && !relay_is_paused()) {
+            bool current_state = relay_get_state();
+            long current_cycles = relay_get_cycle_count();
+            
+            // 检查状态是否真的发生变化
+            if (current_state != last_relay_state || current_cycles != last_cycle_count) {
+                spi_start_time = esp_timer_get_time();
+                
+                // 首次初始化或状态变化时，才需要清屏
+                if (!lcd_initialized || current_state != last_relay_state) {
+                    spilcd_clear(WHITE);
+                    lcd_initialized = true;
+                } else {
+                    // 仅循环数变化时，用白色矩形覆盖旧文本区域（局部刷新）
+                    // 覆盖 "Cycles: XXXX" 区域（假设最多10位数字 + 前缀）
+                    spilcd_fill(10, 40, 200, 60, WHITE);
+                }
+                
+                // 绘制电机状态（仅在状态变化时）
+                if (current_state != last_relay_state) {
+                    if (current_state) {
+                        spilcd_show_string(10, 10, spilcddev.width - 20, 20, 16, "Motor: FORWARD", BLACK);
+                    } else {
+                        spilcd_show_string(10, 10, spilcddev.width - 20, 20, 16, "Motor: REVERSE", BLACK);
+                    }
+                }
+                
+                // 绘制循环次数（每次更新）
+                char cycle_str[32];
+                snprintf(cycle_str, sizeof(cycle_str), "Cycles: %ld", current_cycles);
+                spilcd_show_string(10, 40, spilcddev.width - 20, 20, 16, cycle_str, BLACK);
+                
+                // 记录SPI操作耗时
+                uint32_t spi_time = (uint32_t)(esp_timer_get_time() - spi_start_time);
+                if (spi_time > max_spi_time) {
+                    max_spi_time = spi_time;
+                }
+                
+                // 喂狗（LCD刷新后）
+                esp_task_wdt_reset();
+                
+                // 更新状态记录
+                last_relay_state = current_state;
+                last_cycle_count = current_cycles;
+            }
+            
+            lcd_need_update = false;
+        }
+        
+        // ===== LED指示灯逻辑（与IO16输出同步，暂停时熄灭）=====
+        if (!relay_is_paused()) {
+            gpio_set_level(LED0_GPIO_PIN, relay_get_state() ? 1 : 0);
+        }
+        
+        // ===== TCP重连逻辑（仅在断开且未到最大重试次数时）=====
+        if (!tcp_is_connected() && tcp_reconnect_attempts < MAX_TCP_RECONNECT_ATTEMPTS) {
+            uint64_t current_time = esp_timer_get_time();
+            if (current_time - last_tcp_reconnect_time >= TCP_RECONNECT_BACKOFF_US) {
+                printf("[TCP] Attempting reconnection (%lu/%lu)...\n", 
+                       tcp_reconnect_attempts + 1, MAX_TCP_RECONNECT_ATTEMPTS);
+                
+                // 尝试重新连接TCP
+                if (wifi_is_connected()) {
+                    esp_err_t ret = tcp_client_reconnect();
+                    if (ret == ESP_OK) {
+                        printf("[TCP] Reconnected successfully\n");
+                        tcp_reconnect_attempts = 0; // 重置重连计数
+                    } else {
+                        tcp_reconnect_attempts++;
+                        printf("[TCP] Reconnection failed, will retry later\n");
+                    }
+                    last_tcp_reconnect_time = current_time;
+                } else {
+                    printf("[TCP] WiFi not connected, skipping TCP reconnect\n");
+                    last_tcp_reconnect_time = current_time;
+                }
+            }
+        }
         
         // ===== UART数据接收逻辑 =====
         // 获取缓冲区中的数据长度
@@ -210,13 +470,29 @@ void app_main(void)
                 // 回显接收到的数据（只在接收到数据时才回复）
                 uart_write_bytes(USART_UX, rx_buffer, bytes_read);
                 
-                // 通过WiFi TCP发送数据到服务器
+                // 喂狗（UART操作后）
+                esp_task_wdt_reset();
+                
+                // 通过WiFi TCP发送数据到服务器（带超时保护）
                 if (tcp_is_connected()) {
+                    tcp_start_time = esp_timer_get_time();
                     int sent = wifi_tcp_send((uint8_t *)rx_buffer, bytes_read);
+                    
+                    // 记录TCP操作耗时
+                    uint32_t tcp_time = (uint32_t)(esp_timer_get_time() - tcp_start_time);
+                    if (tcp_time > max_tcp_time) {
+                        max_tcp_time = tcp_time;
+                    }
+                    
+                    // 喂狗（TCP发送后）
+                    esp_task_wdt_reset();
+                    
                     if (sent > 0) {
                         printf("[TCP] Sent %d bytes to server\n", sent);
                     } else {
-                        printf("[TCP] Failed to send data\n");
+                        printf("[TCP] Failed to send data (errno=%d, time=%lu us)\n", errno, tcp_time);
+                        tcp_reconnect_attempts = 0;
+                        last_tcp_reconnect_time = esp_timer_get_time();
                     }
                 } else {
                     printf("[TCP] Not connected, cannot send data\n");
@@ -229,6 +505,9 @@ void app_main(void)
             }
         }
 
+        // ===== 喂看门狗（每次循环结束时喂狗）=====
+        esp_task_wdt_reset();
+        
         vTaskDelay(pdMS_TO_TICKS(10));    /* 延时10ms */
     }
     

@@ -34,7 +34,8 @@ esp_err_t xl9555_read_byte(uint8_t *data, size_t len)
 {
     uint8_t reg_addr = XL9555_INPUT_PORT0_REG;
     
-    return i2c_master_transmit_receive(xl9555_handle, &reg_addr, 1, data, len, -1);
+    // 设置超时时间为100ms，避免永久阻塞
+    return i2c_master_transmit_receive(xl9555_handle, &reg_addr, 1, data, len, pdMS_TO_TICKS(100));
 }
 
 /**
@@ -47,20 +48,18 @@ esp_err_t xl9555_read_byte(uint8_t *data, size_t len)
 esp_err_t xl9555_write_byte(uint8_t reg, uint8_t *data, size_t len)
 {
     esp_err_t ret;
-
-    uint8_t *buf = malloc(1 + len);
-    if (buf == NULL)
-    {
-        ESP_LOGE(xl9555_tag, "%s memory failed", __func__);
-        return ESP_ERR_NO_MEM;      /* 分配内存失败 */
+    uint8_t buf[3];  // 使用栈上缓冲区，避免频繁malloc/free导致的内存碎片
+    
+    if (len > 2) {
+        ESP_LOGE(xl9555_tag, "%s data too long: %zu", __func__, len);
+        return ESP_ERR_INVALID_SIZE;
     }
 
     buf[0] = reg;                   /* 0号元素为寄存器数值 */
     memcpy(buf + 1, data, len);     /* 拷贝数据至存储区中 */
 
-    ret = i2c_master_transmit(xl9555_handle, buf, len + 1, -1);
-
-    free(buf);                      /* 发送完成释放内存 */
+    // 设置超时时间为100ms，避免永久阻塞
+    ret = i2c_master_transmit(xl9555_handle, buf, len + 1, pdMS_TO_TICKS(100));
 
     return ret;
 }

@@ -78,6 +78,13 @@ bool wifi_is_connected(void);
  */
 bool tcp_is_connected(void);
 
+/**
+ * @brief       尝试重新连接TCP服务器
+ * @details     当TCP断开时调用此函数尝试重连
+ * @retval      ESP_OK: 重连成功, ESP_FAIL: 重连失败
+ */
+esp_err_t tcp_client_reconnect(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -28,5 +28,9 @@ bool relay_get_state(void);                             /* 获取当前继电器
 void relay_toggle(void);                                /* 切换继电器状态 */
 bool relay_task_handler(void);                          /* 继电器任务处理(需周期调用) */
 uint32_t relay_get_cycle_count(void);                   /* 获取完成的周期数 */
+void relay_pause(void);                                 /* 暂停继电器控制 */
+void relay_resume(void);                                /* 恢复继电器控制 */
+bool relay_is_paused(void);                             /* 检查是否处于暂停状态 */
+void relay_stop_all(void);                              /* 停止所有继电器输出 */
 
 #endif

@@ -23,6 +23,12 @@ static uint32_t s_timer_count_ms = 0;
 /* 完成的周期计数 */
 static uint32_t s_cycle_count = 0;
 
+/* 暂停状态标志 */
+static bool s_paused = false;
+
+/* 暂停时保存的定时器计数值 */
+static uint32_t s_saved_timer_count_ms = 0;
+
 /**
  * @brief       初始化继电器
  * @retval      ESP_OK:初始化成功
@@ -96,7 +102,7 @@ uint32_t relay_get_cycle_count(void)
 }
 
 /**
- * @brief       �继电器任务处理函数（需要在主循环中周期调用）
+ * @brief       继电器任务处理函数（需要在主循环中周期调用）
  * @details     每8秒自动切换一次IO输出
  *              每完成一个完整周期（IO16: LOW->HIGH->LOW，共16秒）计数加1
  * @param       无
@@ -106,6 +112,11 @@ uint32_t relay_get_cycle_count(void)
 bool relay_task_handler(void)
 {
     bool cycle_completed = false;
+
+    /* 如果处于暂停状态，不执行任何操作 */
+    if (s_paused) {
+        return false;
+    }
 
     s_timer_count_ms += 10;  /* 每次调用增加10ms（需保证调用间隔为10ms） */
 
@@ -128,4 +139,54 @@ bool relay_task_handler(void)
     }
 
     return cycle_completed;
+}
+
+/**
+ * @brief       暂停继电器控制
+ * @details     保存当前定时器计数值，停止继电器输出
+ */
+void relay_pause(void)
+{
+    s_paused = true;
+    s_saved_timer_count_ms = s_timer_count_ms;
+    
+    /* 停止所有继电器输出 */
+    relay_stop_all();
+    
+    ESP_LOGI(TAG, "Relay paused at timer_count=%lu ms", s_saved_timer_count_ms);
+}
+
+/**
+ * @brief       恢复继电器控制
+ * @details     从暂停时的位置继续计时
+ */
+void relay_resume(void)
+{
+    s_paused = false;
+    s_timer_count_ms = s_saved_timer_count_ms;
+    
+    /* 恢复继电器到之前的状态 */
+    relay_set_state(s_relay1_state);
+    
+    ESP_LOGI(TAG, "Relay resumed from timer_count=%lu ms", s_timer_count_ms);
+}
+
+/**
+ * @brief       检查是否处于暂停状态
+ * @retval      true:已暂停, false:未暂停
+ */
+bool relay_is_paused(void)
+{
+    return s_paused;
+}
+
+/**
+ * @brief       停止所有继电器输出
+ * @details     将IO16和IO18都设置为0，停止电机运行
+ */
+void relay_stop_all(void)
+{
+    gpio_set_level(RELAY1_IO, 0);
+    gpio_set_level(RELAY2_IO, 0);
+    ESP_LOGI(TAG, "All relays stopped (IO16=0, IO18=0)");
 }
