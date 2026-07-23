@@ -36,9 +36,13 @@ static bool s_paused = false;
 /* 暂停时保存的定时器计数值 */
 static uint32_t s_saved_timer_count_ms = 0;
 
-/* 可配置的正转和反转周期（毫秒） */
+/* 可配置的正转、反转和停止周期（毫秒） */
 static uint32_t s_forward_period_ms = RELAY_FORWARD_PERIOD_MS;
 static uint32_t s_reverse_period_ms = RELAY_REVERSE_PERIOD_MS;
+static uint32_t s_stop_period_ms = RELAY_STOP_PERIOD_MS;
+
+/* 当前状态阶段 */
+static relay_phase_t s_current_phase = RELAY_PHASE_FORWARD;
 
 /**
  * @brief       计算校验和
@@ -55,6 +59,7 @@ static uint32_t calculate_checksum(const relay_rtc_state_t *state)
     checksum ^= state->cycle_count;
     checksum ^= (state->paused ? 1 : 0);
     checksum ^= state->reset_cause;
+    checksum ^= state->state_phase;
     return checksum;
 }
 
@@ -98,8 +103,9 @@ esp_err_t relay_init(void)
     io_conf.pin_bit_mask = (1ULL << RELAY2_IO);
     ESP_ERROR_CHECK(gpio_config(&io_conf));
 
-    /* 初始状态：继电器1关闭，继电器2开启（互补） */
-    relay_set_state(false);
+    /* 初始状态：停止状态（两个IO都为0） */
+    relay_stop_all();
+    s_current_phase = RELAY_PHASE_STOP1;  // 从停止阶段开始，然后进入正转
 
     ESP_LOGI(TAG, "Relay initialized: IO16=%d, IO18=%d", RELAY1_IO, RELAY2_IO);
     return ESP_OK;
@@ -152,10 +158,12 @@ uint32_t relay_get_cycle_count(void)
 
 /**
  * @brief       继电器任务处理函数（需要在主循环中周期调用）
- * @details     根据当前状态使用不同的定时周期
- *              - 正转状态(IO16=HIGH): 使用RELAY_FORWARD_PERIOD_MS
- *              - 反转状态(IO16=LOW): 使用RELAY_REVERSE_PERIOD_MS
- *              每完成一个完整周期（IO16: LOW->HIGH->LOW）计数加1
+ * @details     实现四阶段状态机：正转→停止→反转→停止→正转...
+ *              - 正转阶段(RELAY_PHASE_FORWARD): IO16=HIGH, IO18=LOW, 持续s_forward_period_ms
+ *              - 停止阶段1(RELAY_PHASE_STOP1): IO16=LOW, IO18=LOW, 持续s_stop_period_ms
+ *              - 反转阶段(RELAY_PHASE_REVERSE): IO16=LOW, IO18=HIGH, 持续s_reverse_period_ms
+ *              - 停止阶段2(RELAY_PHASE_STOP2): IO16=LOW, IO18=LOW, 持续s_stop_period_ms
+ *              每完成一个完整周期（正转+停止+反转+停止）计数加1
  * @param       无
  * @retval      true:完成了一个完整周期, false:无完整周期
  * @note        调用间隔建议为10ms，内部使用计数器实现定时
@@ -171,24 +179,65 @@ bool relay_task_handler(void)
 
     s_timer_count_ms += 10;  /* 每次调用增加10ms（需保证调用间隔为10ms） */
 
-    /* 根据当前状态选择不同的切换周期 */
-    uint32_t current_period = s_relay1_state ? s_forward_period_ms : s_reverse_period_ms;
+    /* 根据当前阶段选择不同的切换周期 */
+    uint32_t current_period = 0;
+    switch (s_current_phase) {
+        case RELAY_PHASE_FORWARD:
+            current_period = s_forward_period_ms;
+            break;
+        case RELAY_PHASE_STOP1:
+        case RELAY_PHASE_STOP2:
+            current_period = s_stop_period_ms;
+            break;
+        case RELAY_PHASE_REVERSE:
+            current_period = s_reverse_period_ms;
+            break;
+        default:
+            current_period = s_forward_period_ms;
+            break;
+    }
 
     if (s_timer_count_ms >= current_period)
     {
         s_timer_count_ms = 0;
-        relay_toggle();
-
-        /* 只有当IO16回到LOW状态时，才算完成一个完整周期（LOW->HIGH->LOW） */
-        if (!s_relay1_state)
-        {
-            s_cycle_count++;
-            cycle_completed = true;
-            ESP_LOGI(TAG, "Full cycle completed! Cycle count: %ld", s_cycle_count);
-        }
-        else
-        {
-            ESP_LOGD(TAG, "Relay toggled (half cycle), IO16=HIGH");
+        
+        /* 切换到下一个阶段 */
+        switch (s_current_phase) {
+            case RELAY_PHASE_FORWARD:
+                /* 正转结束 → 进入停止阶段1 */
+                s_current_phase = RELAY_PHASE_STOP1;
+                relay_stop_all();
+                ESP_LOGD(TAG, "Phase changed: FORWARD -> STOP1");
+                break;
+                
+            case RELAY_PHASE_STOP1:
+                /* 停止阶段1结束 → 进入反转阶段 */
+                s_current_phase = RELAY_PHASE_REVERSE;
+                relay_set_state(false);  // IO16=LOW, IO18=HIGH
+                ESP_LOGD(TAG, "Phase changed: STOP1 -> REVERSE");
+                break;
+                
+            case RELAY_PHASE_REVERSE:
+                /* 反转结束 → 进入停止阶段2 */
+                s_current_phase = RELAY_PHASE_STOP2;
+                relay_stop_all();
+                ESP_LOGD(TAG, "Phase changed: REVERSE -> STOP2");
+                break;
+                
+            case RELAY_PHASE_STOP2:
+                /* 停止阶段2结束 → 进入正转阶段，完成一个完整周期 */
+                s_current_phase = RELAY_PHASE_FORWARD;
+                relay_set_state(true);  // IO16=HIGH, IO18=LOW
+                s_cycle_count++;
+                cycle_completed = true;
+                ESP_LOGI(TAG, "Full cycle completed! Cycle count: %ld", s_cycle_count);
+                ESP_LOGD(TAG, "Phase changed: STOP2 -> FORWARD");
+                break;
+                
+            default:
+                s_current_phase = RELAY_PHASE_FORWARD;
+                relay_set_state(true);
+                break;
         }
     }
 
@@ -257,11 +306,12 @@ void relay_save_to_rtc(void)
     s_rtc_relay_state.timer_count_ms = s_timer_count_ms;
     s_rtc_relay_state.cycle_count = s_cycle_count;
     s_rtc_relay_state.paused = s_paused;
+    s_rtc_relay_state.state_phase = (uint8_t)s_current_phase;
     // reset_cause由main.c设置
     s_rtc_relay_state.checksum = calculate_checksum(&s_rtc_relay_state);
     
-    ESP_LOGD(TAG, "State saved to RTC: relay1=%d, timer=%lu ms, cycles=%lu",
-             s_relay1_state, s_timer_count_ms, s_cycle_count);
+    ESP_LOGD(TAG, "State saved to RTC: relay1=%d, timer=%lu ms, cycles=%lu, phase=%d",
+             s_relay1_state, s_timer_count_ms, s_cycle_count, s_current_phase);
 }
 
 /**
@@ -291,6 +341,7 @@ bool relay_restore_from_rtc(uint32_t reset_cause)
     s_timer_count_ms = s_rtc_relay_state.timer_count_ms;
     s_cycle_count = s_rtc_relay_state.cycle_count;
     s_paused = s_rtc_relay_state.paused;
+    s_current_phase = (relay_phase_t)s_rtc_relay_state.state_phase;
     
     // 如果之前是暂停状态，保存定时器计数
     if (s_paused) {
@@ -298,12 +349,33 @@ bool relay_restore_from_rtc(uint32_t reset_cause)
     }
     
     // 应用恢复的状态到GPIO
-    gpio_set_level(RELAY1_IO, s_relay1_state ? 1 : 0);
-    gpio_set_level(RELAY2_IO, s_relay1_state ? 0 : 1);
+    switch (s_current_phase) {
+        case RELAY_PHASE_FORWARD:
+            gpio_set_level(RELAY1_IO, 1);
+            gpio_set_level(RELAY2_IO, 0);
+            break;
+        case RELAY_PHASE_REVERSE:
+            gpio_set_level(RELAY1_IO, 0);
+            gpio_set_level(RELAY2_IO, 1);
+            break;
+        case RELAY_PHASE_STOP1:
+        case RELAY_PHASE_STOP2:
+            gpio_set_level(RELAY1_IO, 0);
+            gpio_set_level(RELAY2_IO, 0);
+            break;
+        default:
+            gpio_set_level(RELAY1_IO, 0);
+            gpio_set_level(RELAY2_IO, 0);
+            s_current_phase = RELAY_PHASE_STOP1;
+            break;
+    }
     
     ESP_LOGI(TAG, "=== RESTORED FROM RTC MEMORY ===");
-    ESP_LOGI(TAG, "  Relay1 State: %d (%s)", 
-             s_relay1_state, s_relay1_state ? "FORWARD" : "REVERSE");
+    ESP_LOGI(TAG, "  Phase: %d (%s)", 
+             s_current_phase,
+             s_current_phase == RELAY_PHASE_FORWARD ? "FORWARD" :
+             s_current_phase == RELAY_PHASE_STOP1 ? "STOP1" :
+             s_current_phase == RELAY_PHASE_REVERSE ? "REVERSE" : "STOP2");
     ESP_LOGI(TAG, "  Timer Count: %lu ms", s_timer_count_ms);
     ESP_LOGI(TAG, "  Cycle Count: %lu", s_cycle_count);
     ESP_LOGI(TAG, "  Paused: %d", s_paused);
@@ -381,4 +453,30 @@ uint32_t relay_get_forward_period(void)
 uint32_t relay_get_reverse_period(void)
 {
     return s_reverse_period_ms;
+}
+
+/**
+ * @brief       设置停止时间
+ * @param       period_ms: 停止时间（毫秒）
+ * @note        最小值建议100ms，避免频繁切换
+ */
+void relay_set_stop_period(uint32_t period_ms)
+{
+    if (period_ms < 100) {
+        ESP_LOGW(TAG, "Stop period too short, set to minimum 100ms");
+        s_stop_period_ms = 100;
+    } else {
+        s_stop_period_ms = period_ms;
+    }
+    ESP_LOGI(TAG, "Stop period set to %lu ms (%.1f s)", 
+             s_stop_period_ms, s_stop_period_ms / 1000.0);
+}
+
+/**
+ * @brief       获取停止时间
+ * @retval      停止时间（毫秒）
+ */
+uint32_t relay_get_stop_period(void)
+{
+    return s_stop_period_ms;
 }

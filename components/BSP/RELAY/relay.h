@@ -21,12 +21,23 @@
 #define RELAY2_IO          GPIO_NUM_18      /* 继电器2 - 电机反转 */
 
 /* 继电器切换周期（单位：毫秒） */
-#define RELAY_FORWARD_PERIOD_MS    3000       /* 正转时间：8秒 */
-#define RELAY_REVERSE_PERIOD_MS    1000       /* 反转时间：8秒 */
+#define RELAY_FORWARD_PERIOD_MS    15000       /* 正转时间：15秒 */
+#define RELAY_REVERSE_PERIOD_MS    15000       /* 反转时间：15秒 */
+#define RELAY_STOP_PERIOD_MS       5000        /* 停止时间：2秒 */
 // #define RELAY_TOGGLE_PERIOD_MS     8000       /* 兼容旧代码，默认使用正转时间 */
 
 /* RTC内存魔术字，用于验证数据有效性 */
 #define RELAY_RTC_MAGIC    0x52454C41      /* "RELA" */
+
+/**
+ * @brief       继电器状态阶段枚举
+ */
+typedef enum {
+    RELAY_PHASE_FORWARD = 0,    /* 正转阶段：IO16=HIGH, IO18=LOW */
+    RELAY_PHASE_STOP1 = 1,      /* 停止阶段1：IO16=LOW, IO18=LOW (正转→反转) */
+    RELAY_PHASE_REVERSE = 2,    /* 反转阶段：IO16=LOW, IO18=HIGH */
+    RELAY_PHASE_STOP2 = 3       /* 停止阶段2：IO16=LOW, IO18=LOW (反转→正转) */
+} relay_phase_t;
 
 /**
  * @brief       RTC内存中保存的继电器状态结构
@@ -40,6 +51,7 @@ typedef struct {
     bool paused;                  /* 暂停状态 */
     uint32_t reset_cause;         /* 复位原因：0=正常启动, 1=看门狗复位, 2=按键复位 */
     uint32_t checksum;            /* 校验和，用于数据完整性检查 */
+    uint8_t state_phase;          /* 状态阶段：0=正转, 1=停止1, 2=反转, 3=停止2 */
 } relay_rtc_state_t;
 
 /* 函数声明 */
@@ -57,8 +69,10 @@ void relay_stop_all(void);                              /* 停止所有继电器
 /* 动态配置函数 */
 void relay_set_forward_period(uint32_t period_ms);      /* 设置正转时间（毫秒） */
 void relay_set_reverse_period(uint32_t period_ms);      /* 设置反转时间（毫秒） */
+void relay_set_stop_period(uint32_t period_ms);         /* 设置停止时间（毫秒） */
 uint32_t relay_get_forward_period(void);                /* 获取正转时间（毫秒） */
 uint32_t relay_get_reverse_period(void);                /* 获取反转时间（毫秒） */
+uint32_t relay_get_stop_period(void);                   /* 获取停止时间（毫秒） */
 
 /* RTC内存相关函数 */
 void relay_save_to_rtc(void);                           /* 保存状态到RTC内存 */
